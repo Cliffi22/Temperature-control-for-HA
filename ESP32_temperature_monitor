@@ -1,0 +1,203 @@
+#include <WiFi.h>
+#include <OneWire.h>
+#include <DallasTemperature.h>
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <math.h>
+#include <PubSubClient.h>
+
+// ===== WiFi =====
+const char* ssid     = "name_ssid";
+const char* password = "password_ssid*";
+
+// ===== DS18B20 =====
+#define ONE_WIRE_BUS 27
+OneWire oneWire(ONE_WIRE_BUS);
+DallasTemperature sensors(&oneWire);
+DeviceAddress sensorsFound[2];
+int foundCount = 0;
+
+// ===== LCD =====
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+const char* name0 = "Privod";
+const char* name1 = "Zpatek";
+
+// ===== Termostaty =====
+#define TERMOSTAT_PRIZEMI 33
+#define TERMOSTAT_PATRO   32
+
+bool lastTermPrizemi = false;
+bool lastTermPatro   = false;
+
+// ===== MQTT =====
+const char* mqtt_server = "192.168.x.x";
+const char* mqtt_user   = "mqtt_user";
+const char* mqtt_pass   = "mqtt_password";
+
+WiFiClient espClient;
+PubSubClient client(espClient);
+
+// ===== Intervaly =====
+unsigned long lastMQTTSend = 0;
+const unsigned long mqttInterval = 5000;
+
+// ===== Poslední hodnoty =====
+float lastT0 = NAN;
+float lastT1 = NAN;
+
+// ===== Funkce =====
+void reconnectMQTT();
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  // WiFi
+  WiFi.begin(ssid, password);
+  Serial.print("Pripojuji WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500);
+    Serial.print(".");
+  }
+  Serial.println(" ✓");
+  Serial.println(WiFi.localIP());
+
+  // MQTT
+  client.setServer(mqtt_server, 1883);
+
+  // LCD
+  lcd.begin();
+  lcd.backlight();
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("ESP32 kotel");
+
+  // LED indikace
+  pinMode(2, OUTPUT);
+  digitalWrite(2, LOW);
+
+  // Termostaty
+  pinMode(TERMOSTAT_PRIZEMI, INPUT_PULLUP);
+  pinMode(TERMOSTAT_PATRO, INPUT_PULLUP);
+
+  // DS18B20
+  sensors.begin();
+  foundCount = sensors.getDeviceCount();
+  Serial.print("DS18B20 nalezeno: ");
+  Serial.println(foundCount);
+
+  for (int i=0;i<foundCount && i<2;i++)
+  {
+    sensors.getAddress(sensorsFound[i], i);
+  }
+
+  delay(1000);
+  lcd.clear();
+}
+
+void loop() {
+  sensors.requestTemperatures();
+
+  float t0 = NAN;
+  float t1 = NAN;
+
+  if(foundCount>0) t0 = sensors.getTempC(sensorsFound[0]);
+  if(foundCount>1) t1 = sensors.getTempC(sensorsFound[1]);
+
+  // Čtení termostatů
+  bool termPrizemi = digitalRead(TERMOSTAT_PRIZEMI) == LOW;
+  bool termPatro   = digitalRead(TERMOSTAT_PATRO) == LOW;
+
+  // MQTT připojení
+  if (!client.connected()) reconnectMQTT();
+  client.loop();
+
+  // ===== LCD výpis (zarovnaný, hvězdičky) =====
+  char line1[17];
+  char line2[17];
+
+  char star1 = termPrizemi ? '*' : ' ';
+  char star2 = termPatro   ? '*' : ' ';
+
+  if (!isnan(t0))
+    snprintf(line1, sizeof(line1), "Privod %5.1f\xDF""C %c", t0, star1);
+  else
+    snprintf(line1, sizeof(line1), "Privod  --.-\xDF""C %c", star1);
+
+  if (!isnan(t1))
+    snprintf(line2, sizeof(line2), "Zpatek %5.1f\xDF""C %c", t1, star2);
+  else
+    snprintf(line2, sizeof(line2), "Zpatek  --.-\xDF""C %c", star2);
+
+  lcd.setCursor(0,0);
+  lcd.print(line1);
+  lcd.setCursor(0,1);
+  lcd.print(line2);
+
+  // ===== MQTT odeslání každých 5 s, jen při změně >0,1°C =====
+  unsigned long now = millis();
+  if(now-lastMQTTSend >= mqttInterval)
+  {
+    lastMQTTSend = now;
+    digitalWrite(2, HIGH); // LED zapnuta při odeslání
+
+    // Teploty
+    if (!isnan(t0) && (isnan(lastT0) || fabs(t0-lastT0)>0.1))
+    {
+      char msg0[16];
+      dtostrf(t0,4,1,msg0);
+      client.publish("kotel/privod", msg0, true);
+      lastT0 = t0;
+    }
+
+    if (!isnan(t1) && (isnan(lastT1) || fabs(t1-lastT1)>0.1))
+    {
+      char msg1[16];
+      dtostrf(t1,4,1,msg1);
+      client.publish("kotel/zpatecka", msg1, true);
+      lastT1 = t1;
+    }
+
+    // Termostat přízemí
+    if(termPrizemi != lastTermPrizemi)
+    {
+      client.publish("kotel/termostat_prizemi",
+                     termPrizemi ? "ON":"OFF",
+                     true);
+      lastTermPrizemi = termPrizemi;
+    }
+
+    // Termostat patro
+    if(termPatro != lastTermPatro)
+    {
+      client.publish("kotel/termostat_patro",
+                     termPatro ? "ON":"OFF",
+                     true);
+      lastTermPatro = termPatro;
+    }
+
+    delay(100); // krátký blik LED
+    digitalWrite(2, LOW);
+  }
+
+  delay(1000); // LCD každou sekundu
+}
+
+// ===== MQTT reconnect =====
+void reconnectMQTT()
+{
+  while (!client.connected())
+  {
+    Serial.print("MQTT pripojeni...");
+    if(client.connect("ESP32_kotel",mqtt_user,mqtt_pass))
+    {
+      Serial.println("OK");
+    }
+    else
+    {
+      Serial.print("chyba ");
+      Serial.println(client.state());
+      delay(5000);
+    }
+  }
+}
